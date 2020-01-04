@@ -18,6 +18,7 @@ package main
 import (
 	"flag"
 	"os"
+	"time"
 
 	samplecontrollerv1alpha1 "github.com/toshi0607/k8s-sandbox/sample-controller-kubebuilder/api/v1alpha1"
 	"github.com/toshi0607/k8s-sandbox/sample-controller-kubebuilder/controllers"
@@ -53,11 +54,13 @@ func main() {
 		o.Development = true
 	}))
 
+	var resyncPeriod = time.Second * 30
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
+		SyncPeriod:         &resyncPeriod,
 		Scheme:             scheme,
 		MetricsBindAddress: metricsAddr,
 		LeaderElection:     enableLeaderElection,
-		Port:               9443,
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
@@ -65,9 +68,10 @@ func main() {
 	}
 
 	if err = (&controllers.FooReconciler{
-		Client: mgr.GetClient(),
-		Log:    ctrl.Log.WithName("controllers").WithName("Foo"),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Log:      ctrl.Log.WithName("controllers").WithName("Foo"),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("foo-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Foo")
 		os.Exit(1)
