@@ -1,0 +1,7 @@
+domain: k8s.io
+repo: github.com/toshi0607/k8s-sandbox/sample-controller-kubebuilder
+resources:
+- group: samplecontroller
+  kind: Foo
+  version: v1alpha1
+version: "2"
