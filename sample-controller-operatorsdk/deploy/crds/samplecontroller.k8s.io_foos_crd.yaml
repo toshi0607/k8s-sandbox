@@ -9,12 +9,11 @@ spec:
     listKind: FooList
     plural: foos
     singular: foo
-  scope: Namespaced
+  scope: ""
   subresources:
     status: {}
   validation:
     openAPIV3Schema:
-      description: Foo is the Schema for the foos API
       properties:
         apiVersion:
           description: 'APIVersion defines the versioned schema of this representation
@@ -29,10 +28,25 @@ spec:
         metadata:
           type: object
         spec:
-          description: FooSpec defines the desired state of Foo
+          properties:
+            deploymentName:
+              format: string
+              type: string
+            replicas:
+              format: int32
+              minimum: 1
+              type: integer
+          required:
+          - deploymentName
+          - replicas
           type: object
         status:
-          description: FooStatus defines the observed state of Foo
+          properties:
+            availableReplicas:
+              format: int32
+              type: integer
+          required:
+          - availableReplicas
           type: object
       type: object
   version: v1alpha1

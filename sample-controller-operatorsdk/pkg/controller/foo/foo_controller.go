@@ -4,14 +4,14 @@ import (
 	"context"
 
 	samplecontrollerv1alpha1 "github.com/toshi0607/k8s-sandbox/sample-controller-operatorsdk/pkg/apis/samplecontroller/v1alpha1"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -37,30 +37,22 @@ func newReconciler(mgr manager.Manager) reconcile.Reconciler {
 	return &ReconcileFoo{client: mgr.GetClient(), scheme: mgr.GetScheme()}
 }
 
-// add adds a new Controller to mgr with r as the reconcile.Reconciler
 func add(mgr manager.Manager, r reconcile.Reconciler) error {
-	// Create a new controller
 	c, err := controller.New("foo-controller", mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return err
 	}
-
-	// Watch for changes to primary resource Foo
 	err = c.Watch(&source.Kind{Type: &samplecontrollerv1alpha1.Foo{}}, &handler.EnqueueRequestForObject{})
 	if err != nil {
 		return err
 	}
-
-	// TODO(user): Modify this to be the types you create that are owned by the primary resource
-	// Watch for changes to secondary resource Pods and requeue the owner Foo
-	err = c.Watch(&source.Kind{Type: &corev1.Pod{}}, &handler.EnqueueRequestForOwner{
+	err = c.Watch(&source.Kind{Type: &appsv1.Deployment{}}, &handler.EnqueueRequestForOwner{
 		IsController: true,
 		OwnerType:    &samplecontrollerv1alpha1.Foo{},
 	})
 	if err != nil {
 		return err
 	}
-
 	return nil
 }
 
@@ -85,48 +77,144 @@ type ReconcileFoo struct {
 func (r *ReconcileFoo) Reconcile(request reconcile.Request) (reconcile.Result, error) {
 	reqLogger := log.WithValues("Request.Namespace", request.Namespace, "Request.Name", request.Name)
 	reqLogger.Info("Reconciling Foo")
+	ctx := context.Background()
 
-	// Fetch the Foo instance
-	instance := &samplecontrollerv1alpha1.Foo{}
-	err := r.client.Get(context.TODO(), request.NamespacedName, instance)
-	if err != nil {
+	foo := &samplecontrollerv1alpha1.Foo{}
+	if err := r.client.Get(ctx, request.NamespacedName, foo); err != nil {
 		if errors.IsNotFound(err) {
-			// Request object not found, could have been deleted after reconcile request.
-			// Owned objects are automatically garbage collected. For additional cleanup logic use finalizers.
-			// Return and don't requeue
+			reqLogger.Info("Foo not found. Ignore not found")
 			return reconcile.Result{}, nil
 		}
-		// Error reading the object - requeue the request.
+		reqLogger.Error(err, "failed to get Foo")
 		return reconcile.Result{}, err
 	}
 
-	// Define a new Pod object
-	pod := newPodForCR(instance)
-
-	// Set Foo instance as the owner and controller
-	if err := controllerutil.SetControllerReference(instance, pod, r.scheme); err != nil {
+	if err := r.cleanupOwnedResources(ctx, foo); err != nil {
+		reqLogger.Error(err, "failed to clean up old Deployment resources for this Foo")
 		return reconcile.Result{}, err
 	}
 
-	// Check if this Pod already exists
-	found := &corev1.Pod{}
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: pod.Name, Namespace: pod.Namespace}, found)
-	if err != nil && errors.IsNotFound(err) {
-		reqLogger.Info("Creating a new Pod", "Pod.Namespace", pod.Namespace, "Pod.Name", pod.Name)
-		err = r.client.Create(context.TODO(), pod)
-		if err != nil {
+	deploymentName := foo.Spec.DeploymentName
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      deploymentName,
+			Namespace: request.Namespace,
+		},
+	}
+
+	if err := r.client.Get(ctx, client.ObjectKey{Namespace: foo.Namespace, Name: deploymentName}, deployment); err != nil {
+		if errors.IsNotFound(err) {
+			reqLogger.Info("could not find existing Deployment for Foo, creating one...")
+			deployment = newDeployment(foo)
+
+			if err := r.client.Create(ctx, deployment); err != nil {
+				reqLogger.Error(err, "failed to create Deployment resource")
+				return reconcile.Result{}, err
+			}
+
+			reqLogger.Info("created Deployment resource for Foo")
+			return reconcile.Result{}, nil
+		}
+
+		reqLogger.Error(err, "failed to get Deployment for Foo resource")
+		return reconcile.Result{}, err
+	}
+
+	if foo.Spec.Replicas != nil && *foo.Spec.Replicas != *deployment.Spec.Replicas {
+		reqLogger.Info("unmatched spec", "foo.spec.replicas", foo.Spec.Replicas, "deployment.spec.replicas", deployment.Spec.Replicas)
+		reqLogger.Info("Deployment replicas is not equal Foo replicas. reconcile this...")
+
+		if err := r.client.Update(ctx, newDeployment(foo)); err != nil {
+			reqLogger.Error(err, "failed to update Deployment for Foo resource")
 			return reconcile.Result{}, err
 		}
 
-		// Pod created successfully - don't requeue
+		reqLogger.Info("updated Deployment spec for Foo")
 		return reconcile.Result{}, nil
-	} else if err != nil {
-		return reconcile.Result{}, err
 	}
 
-	// Pod already exists - don't requeue
-	reqLogger.Info("Skip reconcile: Pod already exists", "Pod.Namespace", found.Namespace, "Pod.Name", found.Name)
+	if foo.Status.AvailableReplicas != deployment.Status.AvailableReplicas {
+		reqLogger.Info("updating Foo status")
+		foo.Status.AvailableReplicas = deployment.Status.AvailableReplicas
+
+		if err := r.client.Update(ctx, foo); err != nil {
+			reqLogger.Error(err, "failed to update Foo status")
+			return reconcile.Result{}, err
+		}
+
+		reqLogger.Info("updated Foo status", "foo.status.availableReplicas", foo.Status.AvailableReplicas)
+	}
+
 	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileFoo) cleanupOwnedResources(ctx context.Context,
+	foo *samplecontrollerv1alpha1.Foo) error {
+	reqLogger := log.WithValues("Request.Namespace", foo.Namespace, "Request.Name", foo.Name)
+	reqLogger.Info("finding existing Deployments for Foo resource")
+
+	deployments := &appsv1.DeploymentList{}
+	labelSelector := labels.SelectorFromSet(labelsForFoo(foo.Name))
+	listOps := &client.ListOptions{
+		Namespace:     foo.Namespace,
+		LabelSelector: labelSelector,
+	}
+	if err := r.client.List(ctx, deployments, listOps); err != nil {
+		reqLogger.Error(err, "failed to get list of deployments")
+		return err
+	}
+	for _, deployment := range deployments.Items {
+		if deployment.Name == foo.Spec.DeploymentName {
+			continue
+		}
+		if err := r.client.Delete(ctx, &deployment); err != nil {
+			reqLogger.Error(err, "failed to delete Deployment resource")
+			return err
+		}
+		reqLogger.Info("deleted old Deployment resource for Foo", "deploymentName", deployment.Name)
+	}
+
+	return nil
+}
+
+func labelsForFoo(name string) map[string]string {
+	return map[string]string{"app": "nginx", "controller": name}
+}
+
+func newDeployment(foo *samplecontrollerv1alpha1.Foo) *appsv1.Deployment {
+	labels := map[string]string{
+		"app":        "nginx",
+		"controller": foo.Name,
+	}
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      foo.Spec.DeploymentName,
+			Namespace: foo.Namespace,
+			Labels:    labels,
+			OwnerReferences: []metav1.OwnerReference{
+				*metav1.NewControllerRef(foo, samplecontrollerv1alpha1.SchemeGroupVersion.WithKind("Foo")),
+			},
+		},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: foo.Spec.Replicas,
+			Selector: &metav1.LabelSelector{
+				MatchLabels: labels,
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: labels,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  "nginx",
+							Image: "nginx:latest",
+						},
+					},
+				},
+			},
+		},
+	}
 }
 
 // newPodForCR returns a busybox pod with the same name/namespace as the cr
